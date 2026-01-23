@@ -60,10 +60,9 @@ function App() {
   };
 
   const handleDownload = (videoUrl) => {
-  // Use backend proxy to download
-  const downloadUrl = `http://localhost:3001/api/download?url=${encodeURIComponent(videoUrl)}`;
-  window.location.href = downloadUrl;
-};
+    const downloadUrl = `http://localhost:3001/api/download?url=${encodeURIComponent(videoUrl)}`;
+    window.location.href = downloadUrl;
+  };
 
   return (
     <div style={{ minHeight: '100vh', background: 'linear-gradient(to bottom right, #eef2ff, #ffffff, #faf5ff)' }}>
@@ -163,17 +162,51 @@ function App() {
                       {result.title}
                     </h3>
                     <p style={{ fontSize: '0.875rem', color: '#6b7280', margin: 0 }}>
-                      Video extracted successfully!
+                      Found {result.allVideoUrls?.length || 1} video URL(s)
                     </p>
                   </div>
                 </div>
               </div>
 
+              {/* Show all found video URLs */}
+              {result.allVideoUrls && result.allVideoUrls.length > 1 && (
+                <div style={{ marginBottom: '1.5rem', padding: '1rem', background: '#fffbeb', border: '1px solid #fcd34d', borderRadius: '0.5rem' }}>
+                  <p style={{ fontSize: '0.875rem', fontWeight: '500', color: '#92400e', margin: '0 0 0.5rem 0' }}>
+                    Multiple videos found - Select the correct one:
+                  </p>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                    {result.allVideoUrls.map((videoUrl, index) => (
+                      <div key={index} style={{ 
+                        display: 'flex', 
+                        alignItems: 'center', 
+                        gap: '0.5rem',
+                        padding: '0.5rem',
+                        background: 'white',
+                        borderRadius: '0.25rem',
+                        fontSize: '0.75rem',
+                        fontFamily: 'monospace'
+                      }}>
+                        <input
+                          type="radio"
+                          name="videoUrl"
+                          checked={result.videoUrl === videoUrl}
+                          onChange={() => setResult({...result, videoUrl: videoUrl})}
+                          style={{ cursor: 'pointer' }}
+                        />
+                        <span style={{ flex: 1, wordBreak: 'break-all', color: '#374151' }}>
+                          {videoUrl}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Direct Video URL */}
               <div style={{ border: '1px solid #86efac', background: '#f0fdf4', borderRadius: '0.5rem', padding: '1rem', marginBottom: '1.5rem' }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
                   <label style={{ fontSize: '0.875rem', fontWeight: '500', color: '#15803d' }}>
-                    Direct Video URL
+                    Selected Video URL
                   </label>
                   <button
                     onClick={() => handleCopy(result.videoUrl)}
@@ -216,45 +249,80 @@ function App() {
               </div>
 
               {/* Action Buttons */}
-              <div style={{ display: 'flex', gap: '0.75rem' }}>
-                <button
-                  onClick={() => handleDownload(result.videoUrl)}
-                  style={{
-                    flex: 1,
-                    padding: '0.75rem 1.5rem',
-                    background: '#4f46e5',
-                    color: 'white',
-                    borderRadius: '0.5rem',
-                    border: 'none',
-                    cursor: 'pointer',
-                    fontWeight: '500',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: '0.5rem'
-                  }}
-                >
-                  <Download size={20} />
-                  Download Video
-                </button>
-                <button
-                  onClick={() => window.open(result.videoUrl, '_blank')}
-                  style={{
-                    padding: '0.75rem 1.5rem',
-                    border: '1px solid #d1d5db',
-                    color: '#374151',
-                    borderRadius: '0.5rem',
-                    background: 'white',
-                    cursor: 'pointer',
-                    fontWeight: '500',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: '0.5rem'
-                  }}
-                >
-                  <Video size={20} />
-                  Watch
-                </button>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                {result.isM3U8 && (
+                  <div style={{ padding: '1rem', background: '#fffbeb', border: '1px solid #fcd34d', borderRadius: '0.5rem' }}>
+                    <p style={{ fontSize: '0.875rem', color: '#92400e', margin: 0 }}>
+                      <strong>⚠️ HLS Stream Detected:</strong> This is a streaming format (.m3u8). 
+                      To download, you'll need to use tools like <strong>FFmpeg</strong>, <strong>VLC Media Player</strong>, 
+                      or online M3U8 downloaders. The "Watch" button will open it in your browser.
+                    </p>
+                  </div>
+                )}
+                
+                <div style={{ display: 'flex', gap: '0.75rem' }}>
+                  <button
+                    onClick={() => handleDownload(result.videoUrl)}
+                    disabled={result.isM3U8}
+                    style={{
+                      flex: 1,
+                      padding: '0.75rem 1.5rem',
+                      background: result.isM3U8 ? '#9ca3af' : '#4f46e5',
+                      color: 'white',
+                      borderRadius: '0.5rem',
+                      border: 'none',
+                      cursor: result.isM3U8 ? 'not-allowed' : 'pointer',
+                      fontWeight: '500',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '0.5rem'
+                    }}
+                  >
+                    <Download size={20} />
+                    {result.isM3U8 ? 'M3U8 - Use FFmpeg' : 'Download Video'}
+                  </button>
+                  <button
+                    onClick={() => window.open(result.videoUrl, '_blank')}
+                    style={{
+                      padding: '0.75rem 1.5rem',
+                      border: '1px solid #d1d5db',
+                      color: '#374151',
+                      borderRadius: '0.5rem',
+                      background: 'white',
+                      cursor: 'pointer',
+                      fontWeight: '500',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '0.5rem'
+                    }}
+                  >
+                    <Video size={20} />
+                    {result.isM3U8 ? 'Open Stream' : 'Watch'}
+                  </button>
+                </div>
+                
+                {result.isM3U8 && (
+                  <button
+                    onClick={() => handleCopy(`ffmpeg -i "${result.videoUrl}" -c copy output.mp4`)}
+                    style={{
+                      padding: '0.75rem 1.5rem',
+                      border: '1px solid #4f46e5',
+                      color: '#4f46e5',
+                      borderRadius: '0.5rem',
+                      background: 'white',
+                      cursor: 'pointer',
+                      fontWeight: '500',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '0.5rem'
+                    }}
+                  >
+                    <Copy size={20} />
+                    Copy FFmpeg Command
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -331,4 +399,4 @@ function App() {
   );
 }
 
-export default App;
+export default App;  // THIS LINE IS CRITICAL!
