@@ -1,23 +1,11 @@
 @echo off
-echo ================================================
-echo    Starting Video Extractor Application
-echo ================================================
-echo.
-
-echo [1/2] Starting Backend Server...
-start "Backend Server" cmd /k "cd backend && node server.js"
-
-timeout /t 3 /nobreak >nul
-
-echo [2/2] Starting Frontend Server...
-start "Frontend Server" cmd /k "cd frontend && npm start"
-
-echo.
-echo ================================================
-echo    Both servers are starting!
-echo    Backend:  http://localhost:3001
-echo    Frontend: http://localhost:3000
-echo ================================================
-echo.
-echo Press any key to close this window (servers will keep running)...
-pause >nul
+REM One-click launcher. Double-click this file, or run: start.bat [--tools] [--dev] [--no-open]
+cd /d "%~dp0"
+where node >nul 2>nul
+if errorlevel 1 (
+  echo Node.js is not installed. Download it from https://nodejs.org ^(version 20 or newer^).
+  pause
+  exit /b 1
+)
+node run.js %*
+if errorlevel 1 pause

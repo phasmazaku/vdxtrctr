@@ -24,3 +24,9 @@ yarn-error.log*
 
 /backend/node_modules
 /frontend/node_modules
+# backend runtime
+/backend/downloads
+/backend/bin
+/backend/.env
+.idea/
+/frontend/build

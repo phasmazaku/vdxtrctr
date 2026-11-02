@@ -1,402 +1,495 @@
-import React, { useState } from 'react';
-import { Download, Video, AlertCircle, Loader2, Copy, CheckCircle, ExternalLink } from 'lucide-react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  Download, Video, AlertCircle, Loader2, Copy, CheckCircle, ExternalLink, Settings, Play, X,
+  Server, Terminal, ShieldCheck, Film,
+} from 'lucide-react';
+import './App.css';
 
-function App() {
+const API = process.env.REACT_APP_API_URL ||
+  (window.location.port === '3000' ? 'http://127.0.0.1:3001' : '');
+
+const TYPE_LABEL = {
+  hls: 'HLS (.m3u8)', dash: 'DASH (.mpd)', mp4: 'MP4', webm: 'WebM', mkv: 'MKV', mov: 'MOV',
+  flv: 'FLV', video: 'Video', audio: 'Audio', ytdlp: 'yt-dlp',
+};
+const DIRECT = new Set(['mp4', 'webm', 'mkv', 'mov', 'flv', 'video', 'audio']);
+
+function fmtBytes(n) {
+  if (!n) return '';
+  const u = ['B', 'KB', 'MB', 'GB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
+}
+
+function fmtDuration(s) {
+  if (!s) return '';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  return (h ? `${h}:${String(m).padStart(2, '0')}` : `${m}`) + `:${String(sec).padStart(2, '0')}`;
+}
+
+async function api(path, opts = {}) {
+  const r = await fetch(API + path, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+  });
+  let data = null;
+  try { data = await r.json(); } catch { /* non-json */ }
+  if (!r.ok) {
+    const err = new Error((data && data.error) || `Request failed (${r.status})`);
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+function useCopy() {
+  const [copied, setCopied] = useState(null);
+  const copy = useCallback(async (text, key = text) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+    setCopied(key);
+    setTimeout(() => setCopied(null), 1500);
+  }, []);
+  return [copied, copy];
+}
+
+export default function App() {
   const [url, setUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
-  const [copied, setCopied] = useState(false);
+  const [errorData, setErrorData] = useState(null);
+  const [health, setHealth] = useState(null);
+  const [showOpts, setShowOpts] = useState(false);
+  const [opts, setOpts] = useState({ engine: 'auto', timeout: 45, blockAds: true, headless: true });
+  const [jobs, setJobs] = useState([]);
+  const [copied, copy] = useCopy();
+  const startedAt = useRef(0);
+  const [elapsed, setElapsed] = useState(0);
 
-  const extractVideo = async (inputUrl) => {
-    const response = await fetch('http://localhost:3001/api/extract', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ url: inputUrl }),
-    });
+  useEffect(() => {
+    api('/api/health').then(setHealth).catch(() => setHealth({ offline: true }));
+  }, []);
 
-    const data = await response.json();
-    
-    if (!response.ok) {
-      throw new Error(data.error || 'Failed to extract video');
-    }
-    
-    return data;
-  };
+  useEffect(() => {
+    if (!loading) return undefined;
+    startedAt.current = Date.now();
+    const t = setInterval(() => setElapsed(Math.round((Date.now() - startedAt.current) / 1000)), 500);
+    return () => clearInterval(t);
+  }, [loading]);
 
-  const handleExtract = async () => {
-    if (!url.trim()) {
-      setError('Please enter a valid URL');
-      return;
-    }
+  // Poll jobs while any is active.
+  const refreshJobs = useCallback(() => api('/api/jobs').then(setJobs).catch(() => {}), []);
+  useEffect(() => { refreshJobs(); }, [refreshJobs]);
+  const active = jobs.some(j => j.status === 'running' || j.status === 'queued');
+  useEffect(() => {
+    if (!active) return undefined;
+    const t = setInterval(refreshJobs, 1000);
+    return () => clearInterval(t);
+  }, [active, refreshJobs]);
 
+  const extract = async (targetUrl = url, referer) => {
+    const u = (targetUrl || '').trim();
+    if (!u) { setError('Please enter a URL'); return; }
     try {
-      new URL(url);
+      const p = new URL(u);
+      if (!/^https?:$/.test(p.protocol)) throw new Error();
     } catch {
       setError('Please enter a valid URL (must start with http:// or https://)');
       return;
     }
-
+    setUrl(u);
     setLoading(true);
     setError('');
+    setErrorData(null);
     setResult(null);
-
     try {
-      const data = await extractVideo(url);
+      const data = await api('/api/extract', {
+        method: 'POST',
+        body: JSON.stringify({
+          url: u, referer, engine: opts.engine, timeout: opts.timeout * 1000,
+          blockAds: opts.blockAds, headless: opts.headless,
+        }),
+      });
       setResult(data);
     } catch (err) {
-      setError(err.message || 'Failed to extract video. The site might not be supported.');
+      setError(err.message === 'Failed to fetch'
+        ? `Cannot reach the backend at ${API || window.location.origin}. Is it running?`
+        : err.message);
+      setErrorData(err.data || null);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleCopy = (text) => {
-    navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const startJob = async (body) => {
+    try {
+      await api('/api/jobs', { method: 'POST', body: JSON.stringify({ ...body, sid: result?.sessionId, title: result?.title }) });
+      refreshJobs();
+    } catch (e) {
+      setError(e.message);
+    }
   };
 
-  const handleDownload = (videoUrl) => {
-    const downloadUrl = `http://localhost:3001/api/download?url=${encodeURIComponent(videoUrl)}`;
-    window.location.href = downloadUrl;
-  };
+  const tools = health?.tools || {};
 
   return (
-    <div style={{ minHeight: '100vh', background: 'linear-gradient(to bottom right, #eef2ff, #ffffff, #faf5ff)' }}>
-      <div style={{ maxWidth: '56rem', margin: '0 auto', padding: '3rem 1rem' }}>
-        {/* Header */}
-        <div style={{ textAlign: 'center', marginBottom: '3rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '1rem' }}>
-            <Video size={48} color="#4f46e5" />
+    <div className="app">
+      <div className="container">
+        <header className="header">
+          <Video size={44} className="accent" />
+          <h1>Video URL Extractor</h1>
+          <p className="muted">Extract and download videos from ad-heavy sites. Popups, redirects and overlays are blocked for you.</p>
+          <div className="tools">
+            {health?.offline ? (
+              <span className="chip chip-bad">backend offline</span>
+            ) : (
+              <>
+                <span className={`chip ${health ? 'chip-ok' : ''}`}><Server size={12} /> backend</span>
+                <span className={`chip ${tools.ffmpeg ? 'chip-ok' : 'chip-off'}`} title={tools.ffmpeg || 'not installed: run npm run setup-tools in backend/'}>ffmpeg</span>
+                <span className={`chip ${tools.ytdlp ? 'chip-ok' : 'chip-off'}`} title={tools.ytdlp || 'not installed: run npm run setup-tools in backend/'}>yt-dlp</span>
+              </>
+            )}
           </div>
-          <h1 style={{ fontSize: '2.5rem', fontWeight: 'bold', color: '#111827', marginBottom: '0.75rem' }}>
-            Video URL Extractor
-          </h1>
-          <p style={{ fontSize: '1.125rem', color: '#6b7280' }}>
-            Extract direct video URLs from websites - no ads, no hassle
-          </p>
-        </div>
+        </header>
 
-        {/* Main Card */}
-        <div style={{ background: 'white', borderRadius: '1rem', boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.1)', padding: '2rem', marginBottom: '2rem' }}>
-          {/* URL Input */}
-          <div style={{ marginBottom: '1.5rem' }}>
-            <label style={{ display: 'block', fontSize: '0.875rem', fontWeight: '500', color: '#374151', marginBottom: '0.5rem' }}>
-              Video Page URL
-            </label>
-            <div style={{ display: 'flex', gap: '0.75rem' }}>
-              <input
-                type="text"
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                onKeyPress={(e) => e.key === 'Enter' && handleExtract()}
-                placeholder="https://example.com/video/12345"
-                style={{
-                  flex: 1,
-                  padding: '0.75rem 1rem',
-                  border: '1px solid #d1d5db',
-                  borderRadius: '0.5rem',
-                  outline: 'none',
-                  fontSize: '1rem'
-                }}
-                disabled={loading}
-              />
-              <button
-                onClick={handleExtract}
-                disabled={loading}
-                style={{
-                  padding: '0.75rem 1.5rem',
-                  background: loading ? '#9ca3af' : '#4f46e5',
-                  color: 'white',
-                  borderRadius: '0.5rem',
-                  border: 'none',
-                  cursor: loading ? 'not-allowed' : 'pointer',
-                  fontWeight: '500',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '0.5rem'
-                }}
-              >
-                {loading ? (
-                  <>
-                    <Loader2 size={20} style={{ animation: 'spin 1s linear infinite' }} />
-                    Extracting...
-                  </>
-                ) : (
-                  <>
-                    <Download size={20} />
-                    Extract
-                  </>
-                )}
-              </button>
+        <section className="card">
+          <label className="label" htmlFor="url">Video page URL</label>
+          <div className="row">
+            <input
+              id="url"
+              type="text"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && !loading && extract()}
+              placeholder="https://example.com/watch/12345"
+              disabled={loading}
+            />
+            <button className="btn btn-primary" onClick={() => extract()} disabled={loading}>
+              {loading ? <><Loader2 size={18} className="spin" /> {elapsed}s</> : <><Download size={18} /> Extract</>}
+            </button>
+            <button className="btn btn-ghost" onClick={() => setShowOpts(s => !s)} title="Options" aria-label="Options">
+              <Settings size={18} />
+            </button>
+          </div>
+
+          {showOpts && (
+            <div className="opts">
+              <label>
+                Engine
+                <select value={opts.engine} onChange={(e) => setOpts({ ...opts, engine: e.target.value })}>
+                  <option value="auto">Auto (browser, then yt-dlp)</option>
+                  <option value="browser">Browser sniffer only</option>
+                  <option value="ytdlp" disabled={!tools.ytdlp}>yt-dlp only</option>
+                </select>
+              </label>
+              <label>
+                Timeout (s)
+                <input type="number" min="10" max="180" value={opts.timeout}
+                  onChange={(e) => setOpts({ ...opts, timeout: Number(e.target.value) || 45 })} />
+              </label>
+              <label className="check">
+                <input type="checkbox" checked={opts.blockAds} onChange={(e) => setOpts({ ...opts, blockAds: e.target.checked })} />
+                Block ad networks
+              </label>
+              <label className="check" title="Opens a visible Chrome window on the server machine. Useful for Cloudflare / captcha.">
+                <input type="checkbox" checked={!opts.headless} onChange={(e) => setOpts({ ...opts, headless: !e.target.checked })} />
+                Show browser window
+              </label>
             </div>
-          </div>
+          )}
 
-          {/* Error Message */}
+          {loading && (
+            <p className="muted small">Loading the page, killing popups and pressing play... this usually takes 10–40 seconds.</p>
+          )}
+
           {error && (
-            <div style={{ marginBottom: '1.5rem', padding: '1rem', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: '0.5rem', display: 'flex', gap: '0.75rem' }}>
-              <AlertCircle size={20} color="#dc2626" style={{ flexShrink: 0, marginTop: '0.125rem' }} />
+            <div className="alert alert-error">
+              <AlertCircle size={18} />
               <div>
-                <p style={{ color: '#991b1b', fontWeight: '500', margin: 0 }}>Error</p>
-                <p style={{ color: '#b91c1c', fontSize: '0.875rem', margin: '0.25rem 0 0 0' }}>{error}</p>
+                <strong>Error</strong>
+                <p>{error}</p>
+                {errorData?.iframes?.length > 0 && (
+                  <IframeList iframes={errorData.iframes} onExtract={(src) => extract(src, errorData.pageUrl || url)} />
+                )}
+                {errorData?.warnings?.map((w) => <p key={w} className="small">⚠️ {w}</p>)}
+                {errorData?.logs?.length > 0 && <Logs logs={errorData.logs} />}
               </div>
             </div>
           )}
 
-          {/* Results */}
           {result && (
-            <div style={{ marginTop: '1.5rem' }}>
-              {/* Video Info */}
-              <div style={{ border: '1px solid #e5e7eb', borderRadius: '0.5rem', overflow: 'hidden', marginBottom: '1.5rem' }}>
-                <div style={{ display: 'flex', gap: '1rem', padding: '1rem' }}>
-                  <img
-                    src={result.thumbnail}
-                    alt="Video thumbnail"
-                    style={{ width: '160px', height: '96px', objectFit: 'cover', borderRadius: '0.25rem' }}
-                  />
-                  <div style={{ flex: 1 }}>
-                    <h3 style={{ fontWeight: '600', fontSize: '1.125rem', color: '#111827', margin: '0 0 0.25rem 0' }}>
-                      {result.title}
-                    </h3>
-                    <p style={{ fontSize: '0.875rem', color: '#6b7280', margin: 0 }}>
-                      Found {result.allVideoUrls?.length || 1} video URL(s)
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              {/* Show all found video URLs */}
-              {result.allVideoUrls && result.allVideoUrls.length > 1 && (
-                <div style={{ marginBottom: '1.5rem', padding: '1rem', background: '#fffbeb', border: '1px solid #fcd34d', borderRadius: '0.5rem' }}>
-                  <p style={{ fontSize: '0.875rem', fontWeight: '500', color: '#92400e', margin: '0 0 0.5rem 0' }}>
-                    Multiple videos found - Select the correct one:
-                  </p>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                    {result.allVideoUrls.map((videoUrl, index) => (
-                      <div key={index} style={{ 
-                        display: 'flex', 
-                        alignItems: 'center', 
-                        gap: '0.5rem',
-                        padding: '0.5rem',
-                        background: 'white',
-                        borderRadius: '0.25rem',
-                        fontSize: '0.75rem',
-                        fontFamily: 'monospace'
-                      }}>
-                        <input
-                          type="radio"
-                          name="videoUrl"
-                          checked={result.videoUrl === videoUrl}
-                          onChange={() => setResult({...result, videoUrl: videoUrl})}
-                          style={{ cursor: 'pointer' }}
-                        />
-                        <span style={{ flex: 1, wordBreak: 'break-all', color: '#374151' }}>
-                          {videoUrl}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Direct Video URL */}
-              <div style={{ border: '1px solid #86efac', background: '#f0fdf4', borderRadius: '0.5rem', padding: '1rem', marginBottom: '1.5rem' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
-                  <label style={{ fontSize: '0.875rem', fontWeight: '500', color: '#15803d' }}>
-                    Selected Video URL
-                  </label>
-                  <button
-                    onClick={() => handleCopy(result.videoUrl)}
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '0.25rem',
-                      fontSize: '0.875rem',
-                      color: '#15803d',
-                      background: 'none',
-                      border: 'none',
-                      cursor: 'pointer'
-                    }}
-                  >
-                    {copied ? (
-                      <>
-                        <CheckCircle size={16} />
-                        Copied!
-                      </>
-                    ) : (
-                      <>
-                        <Copy size={16} />
-                        Copy
-                      </>
-                    )}
-                  </button>
-                </div>
-                <div style={{
-                  background: 'white',
-                  border: '1px solid #86efac',
-                  borderRadius: '0.25rem',
-                  padding: '0.75rem',
-                  fontSize: '0.875rem',
-                  color: '#374151',
-                  fontFamily: 'monospace',
-                  wordBreak: 'break-all'
-                }}>
-                  {result.videoUrl}
-                </div>
-              </div>
-
-              {/* Action Buttons */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-                {result.isM3U8 && (
-                  <div style={{ padding: '1rem', background: '#fffbeb', border: '1px solid #fcd34d', borderRadius: '0.5rem' }}>
-                    <p style={{ fontSize: '0.875rem', color: '#92400e', margin: 0 }}>
-                      <strong>⚠️ HLS Stream Detected:</strong> This is a streaming format (.m3u8). 
-                      To download, you'll need to use tools like <strong>FFmpeg</strong>, <strong>VLC Media Player</strong>, 
-                      or online M3U8 downloaders. The "Watch" button will open it in your browser.
-                    </p>
-                  </div>
-                )}
-                
-                <div style={{ display: 'flex', gap: '0.75rem' }}>
-                  <button
-                    onClick={() => handleDownload(result.videoUrl)}
-                    disabled={result.isM3U8}
-                    style={{
-                      flex: 1,
-                      padding: '0.75rem 1.5rem',
-                      background: result.isM3U8 ? '#9ca3af' : '#4f46e5',
-                      color: 'white',
-                      borderRadius: '0.5rem',
-                      border: 'none',
-                      cursor: result.isM3U8 ? 'not-allowed' : 'pointer',
-                      fontWeight: '500',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      gap: '0.5rem'
-                    }}
-                  >
-                    <Download size={20} />
-                    {result.isM3U8 ? 'M3U8 - Use FFmpeg' : 'Download Video'}
-                  </button>
-                  <button
-                    onClick={() => window.open(result.videoUrl, '_blank')}
-                    style={{
-                      padding: '0.75rem 1.5rem',
-                      border: '1px solid #d1d5db',
-                      color: '#374151',
-                      borderRadius: '0.5rem',
-                      background: 'white',
-                      cursor: 'pointer',
-                      fontWeight: '500',
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '0.5rem'
-                    }}
-                  >
-                    <Video size={20} />
-                    {result.isM3U8 ? 'Open Stream' : 'Watch'}
-                  </button>
-                </div>
-                
-                {result.isM3U8 && (
-                  <button
-                    onClick={() => handleCopy(`ffmpeg -i "${result.videoUrl}" -c copy output.mp4`)}
-                    style={{
-                      padding: '0.75rem 1.5rem',
-                      border: '1px solid #4f46e5',
-                      color: '#4f46e5',
-                      borderRadius: '0.5rem',
-                      background: 'white',
-                      cursor: 'pointer',
-                      fontWeight: '500',
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'center',
-                      gap: '0.5rem'
-                    }}
-                  >
-                    <Copy size={20} />
-                    Copy FFmpeg Command
-                  </button>
-                )}
-              </div>
-            </div>
+            <Result
+              result={result}
+              tools={tools}
+              copied={copied}
+              copy={copy}
+              startJob={startJob}
+              onExtractIframe={(src) => extract(src, result.pageUrl || url)}
+            />
           )}
-        </div>
+        </section>
 
-        {/* How It Works */}
-        <div style={{ background: 'white', borderRadius: '0.75rem', boxShadow: '0 10px 15px -3px rgba(0, 0, 0, 0.1)', padding: '1.5rem' }}>
-          <h2 style={{ fontSize: '1.25rem', fontWeight: 'bold', color: '#111827', marginBottom: '1rem' }}>How It Works</h2>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', color: '#374151' }}>
-            <div style={{ display: 'flex', gap: '0.75rem' }}>
-              <span style={{ 
-                flexShrink: 0, 
-                width: '1.5rem', 
-                height: '1.5rem', 
-                background: '#eef2ff', 
-                color: '#4f46e5', 
-                borderRadius: '50%', 
-                display: 'flex', 
-                alignItems: 'center', 
-                justifyContent: 'center', 
-                fontSize: '0.875rem', 
-                fontWeight: 'bold' 
-              }}>1</span>
-              <p style={{ margin: 0 }}>Paste the URL of any video page</p>
-            </div>
-            <div style={{ display: 'flex', gap: '0.75rem' }}>
-              <span style={{ 
-                flexShrink: 0, 
-                width: '1.5rem', 
-                height: '1.5rem', 
-                background: '#eef2ff', 
-                color: '#4f46e5', 
-                borderRadius: '50%', 
-                display: 'flex', 
-                alignItems: 'center', 
-                justifyContent: 'center', 
-                fontSize: '0.875rem', 
-                fontWeight: 'bold' 
-              }}>2</span>
-              <p style={{ margin: 0 }}>Our server extracts the direct video URL</p>
-            </div>
-            <div style={{ display: 'flex', gap: '0.75rem' }}>
-              <span style={{ 
-                flexShrink: 0, 
-                width: '1.5rem', 
-                height: '1.5rem', 
-                background: '#eef2ff', 
-                color: '#4f46e5', 
-                borderRadius: '50%', 
-                display: 'flex', 
-                alignItems: 'center', 
-                justifyContent: 'center', 
-                fontSize: '0.875rem', 
-                fontWeight: 'bold' 
-              }}>3</span>
-              <p style={{ margin: 0 }}>Stream or download directly - no ads!</p>
-            </div>
-          </div>
-        </div>
+        {jobs.length > 0 && <Jobs jobs={jobs} refresh={refreshJobs} />}
 
-        {/* Footer */}
-        <div style={{ textAlign: 'center', marginTop: '2rem', fontSize: '0.875rem', color: '#9ca3af' }}>
-          For educational purposes only. Respect copyright and terms of service.
-        </div>
+        <section className="card how">
+          <h2>How it works</h2>
+          <ol>
+            <li>A headless Chrome opens the page with popups, new tabs, redirect hijacks, alerts and known ad networks blocked.</li>
+            <li>It presses play (JS + real mouse clicks), removes click-jacking overlays and sniffs every frame&apos;s network traffic, player configs and (packed / base64) scripts.</li>
+            <li>Direct files stream through the server with the right Referer/cookies; HLS is downloaded segment-by-segment (AES-128 supported); DASH and 1800+ sites via ffmpeg / yt-dlp.</li>
+          </ol>
+        </section>
+
+        <footer className="muted small center">For personal use only. Respect copyright and the site&apos;s terms of service. DRM-protected streams are not supported.</footer>
       </div>
-
-      <style>{`
-        @keyframes spin {
-          from { transform: rotate(0deg); }
-          to { transform: rotate(360deg); }
-        }
-      `}</style>
     </div>
   );
 }
 
-export default App;  // THIS LINE IS CRITICAL!
+function Result({ result, tools, copied, copy, startJob, onExtractIframe }) {
+  const [thumbOk, setThumbOk] = useState(true);
+  const s = result.stats || {};
+  return (
+    <div className="result">
+      <div className="meta">
+        {result.thumbnail && thumbOk ? (
+          <img src={result.thumbnail} alt="" onError={() => setThumbOk(false)} referrerPolicy="no-referrer" />
+        ) : (
+          <div className="thumb-ph"><Film size={32} /></div>
+        )}
+        <div>
+          <h3>{result.title}</h3>
+          <p className="muted small">
+            {result.candidates.length} candidate(s) · engine: {result.engine}
+            {result.elapsedMs ? ` · ${(result.elapsedMs / 1000).toFixed(1)}s` : ''}
+          </p>
+          <div className="chips">
+            {s.popupsBlocked > 0 && <span className="chip chip-ok"><ShieldCheck size={12} /> {s.popupsBlocked} popups blocked</span>}
+            {s.navBlocked > 0 && <span className="chip chip-ok"><ShieldCheck size={12} /> {s.navBlocked} redirects blocked</span>}
+            {s.adsBlocked > 0 && <span className="chip chip-ok"><ShieldCheck size={12} /> {s.adsBlocked} ad requests blocked</span>}
+            {result.usesMSE && <span className="chip">MSE player</span>}
+          </div>
+        </div>
+      </div>
+
+      {result.warnings?.map((w) => (
+        <div key={w} className="alert alert-warn"><AlertCircle size={16} /><p>{w}</p></div>
+      ))}
+
+      <div className="cands">
+        {result.candidates.map((c, i) => (
+          <Candidate key={c.url} c={c} best={i === 0} result={result} tools={tools} copied={copied} copy={copy} startJob={startJob} />
+        ))}
+      </div>
+
+      {result.iframes?.length > 0 && (
+        <details className="details">
+          <summary>Embedded players / iframes ({result.iframes.length})</summary>
+          <IframeList iframes={result.iframes} onExtract={onExtractIframe} />
+        </details>
+      )}
+      {result.logs?.length > 0 && <Logs logs={result.logs} />}
+    </div>
+  );
+}
+
+function Candidate({ c, best, result, tools, copied, copy, startJob }) {
+  const [variant, setVariant] = useState(c.variants?.[0]?.url || '');
+  const [format, setFormat] = useState('');
+  const [preview, setPreview] = useState(false);
+  const [cmds, setCmds] = useState(null);
+
+  const q = (extra = {}) => new URLSearchParams({
+    url: c.url, sid: result.sessionId || '', referer: c.referer || '', title: result.title || '', ...extra,
+  }).toString();
+  const proxyUrl = `${API}/api/download?${q()}`;
+  const isDirect = DIRECT.has(c.type);
+  const blocked = !!c.drm;
+
+  const loadCmds = async () => {
+    if (cmds) { setCmds(null); return; }
+    try { setCmds(await api(`/api/commands?${q()}`)); } catch (e) { setCmds({ error: e.message }); }
+  };
+
+  return (
+    <div className={`cand ${best ? 'cand-best' : ''} ${c.isAd ? 'cand-ad' : ''}`}>
+      <div className="cand-head">
+        <span className={`badge badge-${c.type}`}>{TYPE_LABEL[c.type] || c.type}</span>
+        {best && <span className="badge badge-best">best match</span>}
+        {c.label && <span className="muted small">{c.label}</span>}
+        {c.size ? <span className="muted small">{fmtBytes(c.size)}</span> : null}
+        {c.duration ? <span className="muted small">{fmtDuration(c.duration)}</span> : null}
+        {c.encrypted && !c.drm && <span className="chip">AES-128</span>}
+        {c.drm && <span className="chip chip-bad">DRM: {c.drm}</span>}
+        {c.live && <span className="chip chip-warn">live</span>}
+        {c.isAd && <span className="chip chip-bad">ad?</span>}
+        <span className="muted small grow right" title={`score ${c.score} · found via ${c.sources?.join(', ')}`}>
+          via {c.sources?.join(', ')}
+        </span>
+      </div>
+      <div className="url mono">{c.url}</div>
+
+      {c.variants?.length > 0 && (
+        <label className="inline">
+          Quality
+          <select value={variant} onChange={(e) => setVariant(e.target.value)}>
+            {c.variants.map(v => <option key={v.url} value={v.url}>{v.label}</option>)}
+          </select>
+          {c.hasSeparateAudio && !tools.ffmpeg && <span className="small warn-text">separate audio track: install ffmpeg to merge</span>}
+        </label>
+      )}
+      {c.formats?.length > 0 && (
+        <label className="inline">
+          Format
+          <select value={format} onChange={(e) => setFormat(e.target.value)}>
+            <option value="">Best available</option>
+            {c.formats.map(f => <option key={f.id} value={f.id}>{f.label}</option>)}
+          </select>
+        </label>
+      )}
+
+      <div className="actions">
+        {isDirect && (
+          <a className={`btn btn-primary ${blocked ? 'disabled' : ''}`} href={proxyUrl}>
+            <Download size={16} /> Download
+          </a>
+        )}
+        {isDirect && (
+          <button className="btn" onClick={() => startJob({ kind: 'direct', url: c.url, referer: c.referer })}>
+            <Server size={16} /> Save on server
+          </button>
+        )}
+        {c.type === 'hls' && (
+          <button className="btn btn-primary" disabled={blocked}
+            onClick={() => startJob({ kind: 'hls', url: c.url, referer: c.referer, variantUrl: variant || undefined })}>
+            <Download size={16} /> Download {tools.ffmpeg ? 'MP4' : '(.ts)'}
+          </button>
+        )}
+        {c.type === 'hls' && tools.ffmpeg && (
+          <button className="btn" disabled={blocked}
+            onClick={() => startJob({ kind: 'ffmpeg', url: variant || c.url, referer: c.referer })}>
+            via ffmpeg
+          </button>
+        )}
+        {c.type === 'dash' && (
+          <button className="btn btn-primary" disabled={blocked || (!tools.ffmpeg && !tools.ytdlp)}
+            title={!tools.ffmpeg && !tools.ytdlp ? 'Needs ffmpeg or yt-dlp' : ''}
+            onClick={() => startJob({ kind: tools.ffmpeg ? 'ffmpeg' : 'ytdlp', url: c.url, referer: c.referer })}>
+            <Download size={16} /> Download {!tools.ffmpeg && !tools.ytdlp ? '(needs ffmpeg)' : ''}
+          </button>
+        )}
+        {c.type === 'ytdlp' && (
+          <button className="btn btn-primary" disabled={!tools.ytdlp}
+            onClick={() => startJob({ kind: 'ytdlp', url: c.url, referer: c.referer, format: format || undefined })}>
+            <Download size={16} /> Download with yt-dlp
+          </button>
+        )}
+        {(c.type === 'hls' || c.type === 'dash') && tools.ytdlp && (
+          <button className="btn" disabled={blocked}
+            onClick={() => startJob({ kind: 'ytdlp', url: c.url, referer: c.referer })}>
+            via yt-dlp
+          </button>
+        )}
+        {isDirect && c.type !== 'audio' && (
+          <button className="btn" onClick={() => setPreview(p => !p)}><Play size={16} /> {preview ? 'Hide' : 'Preview'}</button>
+        )}
+        <button className="btn" onClick={() => copy(c.url, c.url)}>
+          {copied === c.url ? <><CheckCircle size={16} /> Copied</> : <><Copy size={16} /> URL</>}
+        </button>
+        {c.type !== 'ytdlp' && (
+          <button className="btn" onClick={loadCmds}><Terminal size={16} /> Commands</button>
+        )}
+        <a className="btn" href={c.url} target="_blank" rel="noreferrer noopener"><ExternalLink size={16} /> Open</a>
+      </div>
+
+      {preview && (
+        // eslint-disable-next-line jsx-a11y/media-has-caption
+        <video className="preview" src={`${API}/api/download?${q({ inline: '1' })}`} controls autoPlay muted />
+      )}
+
+      {cmds && (
+        <div className="cmds">
+          {cmds.error ? <p className="small">{cmds.error}</p> : ['ffmpeg', 'ytdlp', 'curl'].map(k => (
+            <div key={k} className="cmd">
+              <div className="cmd-head">
+                <span className="small">{k}</span>
+                <button className="btn btn-xs" onClick={() => copy(cmds[k], k + c.url)}>
+                  {copied === k + c.url ? 'Copied' : 'Copy'}
+                </button>
+              </div>
+              <pre className="mono">{cmds[k]}</pre>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Jobs({ jobs, refresh }) {
+  const cancel = async (id) => { await api(`/api/jobs/${id}`, { method: 'DELETE' }).catch(() => {}); refresh(); };
+  return (
+    <section className="card">
+      <h2>Downloads</h2>
+      <div className="jobs">
+        {jobs.map(j => (
+          <div key={j.id} className={`job job-${j.status}`}>
+            <div className="job-head">
+              <span className="badge">{j.kind}</span>
+              <strong className="grow ellipsis">{j.filename || j.title || j.id}</strong>
+              <span className="small muted">{j.status}</span>
+              {(j.status === 'running' || j.status === 'queued') && (
+                <button className="btn btn-xs" onClick={() => cancel(j.id)}><X size={14} /> Cancel</button>
+              )}
+              {j.status === 'done' && (
+                <a className="btn btn-xs btn-primary" href={`${API}/api/jobs/${j.id}/file`}><Download size={14} /> Save file</a>
+              )}
+            </div>
+            {(j.status === 'running' || j.status === 'queued') && (
+              <div className="bar"><div style={{ width: `${Math.round((j.progress || 0) * 100)}%` }} /></div>
+            )}
+            <div className="small muted">
+              {j.error || j.message}{j.bytes && j.status === 'done' ? ` · ${fmtBytes(j.bytes)}` : ''}
+            </div>
+            {j.warnings?.map(w => <div key={w} className="small warn-text">⚠️ {w}</div>)}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function IframeList({ iframes, onExtract }) {
+  return (
+    <div className="iframes">
+      {iframes.map(f => (
+        <div key={f.src} className="iframe-row">
+          <span className="mono small grow ellipsis" title={f.src}>{f.src}</span>
+          {f.width ? <span className="small muted">{f.width}×{f.height}</span> : null}
+          <button className="btn btn-xs" onClick={() => onExtract(f.src)}>Extract this</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Logs({ logs }) {
+  return (
+    <details className="details">
+      <summary>Extraction log</summary>
+      <pre className="mono logs">{logs.join('\n')}</pre>
+    </details>
+  );
+}

@@ -1,366 +1,333 @@
+'use strict';
+
+require('dotenv').config();
 const express = require('express');
-const puppeteer = require('puppeteer');
 const cors = require('cors');
-const axios = require('axios');
+const path = require('path');
+const fs = require('fs');
+const { Readable } = require('stream');
+const { pipeline } = require('stream/promises');
+
+const { extractWithBrowser, closeBrowsers, analysePlaylist } = require('./lib/extractor');
+const { extractWithYtdlp } = require('./lib/ytdlp');
+const { detect } = require('./lib/tools');
+const { headersFor, createSession } = require('./lib/sessions');
+const { createJob, getJob, listJobs, cancelJob, publicJob, DOWNLOAD_DIR, ffmpegHeaderArgs } = require('./lib/jobs');
+const { httpGet, lower } = require('./lib/http');
+const {
+  classify, isHttpUrl, contentDisposition, extFromContentType, extFromUrl, DIRECT_TYPES,
+} = require('./lib/util');
 
 const app = express();
-const PORT = 3001;
+const PORT = Number(process.env.PORT || 3001);
+// Bind to localhost by default: /api/download is a generic proxy and must not
+// be exposed to the network unless you really mean it (HOST=0.0.0.0).
+const HOST = process.env.HOST || '127.0.0.1';
 
-// Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'Server is running!' });
+const log = (...a) => console.log(...a);
+
+// ---------------------------------------------------------------------------
+app.get(['/health', '/api/health'], (req, res) => {
+  const t = detect(req.query.refresh === '1');
+  res.json({
+    status: 'Server is running!',
+    tools: {
+      ffmpeg: t.ffmpeg ? t.ffmpeg.version : null,
+      ytdlp: t.ytdlp ? t.ytdlp.version : null,
+    },
+    downloadDir: DOWNLOAD_DIR,
+  });
 });
 
-// Main extraction endpoint (ENHANCED)
-app.post('/api/extract', async (req, res) => {
-  const { url } = req.body;
+// ---------------------------------------------------------------------------
+// Extraction
+// ---------------------------------------------------------------------------
+function legacyFields(result) {
+  // Keep the response backwards compatible with the original frontend.
+  const best = result.candidates[0];
+  return {
+    videoUrl: best?.url || null,
+    allVideoUrls: result.candidates.map(c => c.url),
+    isM3U8: best?.type === 'hls',
+    isDirectMP4: best?.type === 'mp4',
+  };
+}
 
-  if (!url) {
-    return res.status(400).json({ 
-      success: false, 
-      error: 'URL is required' 
-    });
-  }
+function hasUsable(result) {
+  return result.candidates.some(c => !c.isAd && !c.drm && c.score > 40);
+}
 
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`Extracting video from: ${url}`);
-  console.log('='.repeat(60));
-
-  let browser;
-  try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process'
-      ]
-    });
-
-    const page = await browser.newPage();
-    
-    // Set realistic viewport
-    await page.setViewport({ width: 1920, height: 1080 });
-    
-    // Set user agent to look like a real browser
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-
-    let videoUrls = [];
-    let m3u8Urls = [];
-    let mp4Urls = [];
-
-    // Intercept ALL network requests
-    await page.setRequestInterception(true);
-    
-    page.on('request', (request) => {
-      request.continue();
-    });
-
-    page.on('response', async response => {
-      try {
-        const responseUrl = response.url();
-        const contentType = response.headers()['content-type'] || '';
-
-        // Look for video files
-        if (
-          contentType.includes('video') ||
-          contentType.includes('mpegurl') ||
-          contentType.includes('application/vnd.apple.mpegurl') ||
-          responseUrl.match(/\.(mp4|webm|m3u8|mov|avi|mkv|ts)(\?|$|#)/i) ||
-          responseUrl.includes('/video/') ||
-          responseUrl.includes('stream') ||
-          responseUrl.includes('.m3u8')
-        ) {
-          console.log(`📹 Found video URL: ${responseUrl}`);
-          
-          if (responseUrl.includes('.m3u8')) {
-            console.log(`   ✓ HLS Stream (m3u8): ${responseUrl}`);
-            if (!m3u8Urls.includes(responseUrl)) {
-              m3u8Urls.push(responseUrl);
-            }
-          }
-          
-          if (responseUrl.match(/\.mp4(\?|$|#)/i)) {
-            console.log(`   ✓ MP4 Video: ${responseUrl}`);
-            if (!mp4Urls.includes(responseUrl)) {
-              mp4Urls.push(responseUrl);
-            }
-          }
-          
-          if (!videoUrls.includes(responseUrl)) {
-            videoUrls.push(responseUrl);
-          }
-        }
-      } catch (err) {
-        // Ignore errors from checking responses
-      }
-    });
-
-    console.log('🌐 Navigating to page...');
-    await page.goto(url, { 
-      waitUntil: 'networkidle0',
-      timeout: 60000 
-    });
-
-    console.log('⏳ Waiting for dynamic content to load...');
-    
-    // Wait for common video player elements
+/** User pasted a direct media link: no browser needed. */
+async function extractDirect(url, referer) {
+  const type = classify(url);
+  const sessionId = createSession({ pageUrl: referer || url, cookies: [], requestHeaders: new Map() });
+  const c = {
+    url, type, score: 100, sources: ['input'], referer: referer || null, frameUrl: referer || url, size: null,
+    playlist: null,
+  };
+  if (type === 'hls' || type === 'dash') {
     try {
-      await Promise.race([
-        page.waitForSelector('video', { timeout: 10000 }),
-        page.waitForSelector('.video-js', { timeout: 10000 }),
-        page.waitForSelector('[class*="player"]', { timeout: 10000 }),
-        new Promise(resolve => setTimeout(resolve, 10000))
-      ]);
-    } catch (e) {
-      console.log('   No video element found yet, continuing...');
-    }
-
-    // Additional wait for video to start loading
-    await new Promise(resolve => setTimeout(resolve, 8000));
-
-    console.log('🔍 Searching for video sources in DOM...');
-    
-    // Extract video URLs from DOM
-    const domVideoData = await page.evaluate(() => {
-      const results = {
-        videos: [],
-        sources: [],
-        iframes: [],
-        jwplayer: null,
-        videojs: null
-      };
-      
-      // Check for video elements
-      document.querySelectorAll('video').forEach(video => {
-        if (video.src) results.videos.push(video.src);
-        if (video.currentSrc) results.videos.push(video.currentSrc);
-        
-        video.querySelectorAll('source').forEach(source => {
-          if (source.src) results.sources.push(source.src);
-        });
-      });
-      
-      // Check for iframes
-      document.querySelectorAll('iframe').forEach(iframe => {
-        if (iframe.src) results.iframes.push(iframe.src);
-      });
-      
-      // Check for JW Player config
-      if (window.jwplayer && typeof window.jwplayer === 'function') {
-        try {
-          const player = window.jwplayer();
-          if (player && player.getPlaylist) {
-            const playlist = player.getPlaylist();
-            if (playlist && playlist.length > 0) {
-              results.jwplayer = playlist[0].sources;
-            }
-          }
-        } catch (e) {}
-      }
-      
-      // Check for Video.js
-      if (window.videojs) {
-        try {
-          const players = document.querySelectorAll('.video-js');
-          players.forEach(el => {
-            const player = window.videojs(el.id);
-            if (player && player.currentSrc) {
-              results.videojs = player.currentSrc();
-            }
-          });
-        } catch (e) {}
-      }
-      
-      // Look for video URLs in script tags
-      const scripts = Array.from(document.querySelectorAll('script'));
-      scripts.forEach(script => {
-        const content = script.textContent || '';
-        const m3u8Match = content.match(/https?:\/\/[^\s"']+\.m3u8[^\s"']*/gi);
-        const mp4Match = content.match(/https?:\/\/[^\s"']+\.mp4[^\s"']*/gi);
-        
-        if (m3u8Match) results.sources.push(...m3u8Match);
-        if (mp4Match) results.sources.push(...mp4Match);
-      });
-      
-      return results;
-    });
-
-    console.log(`📺 DOM Analysis Results:`);
-    console.log(`   Video elements: ${domVideoData.videos.length}`);
-    console.log(`   Source elements: ${domVideoData.sources.length}`);
-    console.log(`   iFrames: ${domVideoData.iframes.length}`);
-    
-    if (domVideoData.videos.length > 0) {
-      domVideoData.videos.forEach(v => {
-        if (v && !videoUrls.includes(v)) {
-          console.log(`   + Adding from <video>: ${v}`);
-          videoUrls.push(v);
-          if (v.includes('.mp4')) mp4Urls.push(v);
-          if (v.includes('.m3u8')) m3u8Urls.push(v);
-        }
-      });
-    }
-    
-    if (domVideoData.sources.length > 0) {
-      domVideoData.sources.forEach(v => {
-        if (v && !videoUrls.includes(v)) {
-          console.log(`   + Adding from <source>: ${v}`);
-          videoUrls.push(v);
-          if (v.includes('.mp4')) mp4Urls.push(v);
-          if (v.includes('.m3u8')) m3u8Urls.push(v);
-        }
-      });
-    }
-
-    if (domVideoData.jwplayer) {
-      console.log(`   + Found JW Player config`);
-      domVideoData.jwplayer.forEach(src => {
-        if (src.file && !videoUrls.includes(src.file)) {
-          videoUrls.push(src.file);
-          if (src.file.includes('.mp4')) mp4Urls.push(src.file);
-          if (src.file.includes('.m3u8')) m3u8Urls.push(src.file);
-        }
-      });
-    }
-
-    const title = await page.title();
-    await browser.close();
-
-    console.log(`\n📊 FINAL SUMMARY:`);
-    console.log(`   Total video URLs found: ${videoUrls.length}`);
-    console.log(`   MP4 files: ${mp4Urls.length}`);
-    console.log(`   M3U8 streams: ${m3u8Urls.length}`);
-    console.log(`   Page title: ${title}`);
-    
-    // Filter and prioritize URLs
-    const filteredUrls = videoUrls.filter(v => {
-      const isPageUrl = v === url || v.startsWith(url.split('?')[0]);
-      const isVideoFile = v.match(/\.(mp4|webm|m3u8|mov|avi|mkv)(\?|$|#)/i);
-      const looksLikeVideo = v.includes('stream') || v.includes('video') || v.includes('/v/');
-      return !isPageUrl && (isVideoFile || looksLikeVideo);
-    });
-
-    // Prioritize: MP4 first, then M3U8
-    const bestVideoUrl = mp4Urls[0] || m3u8Urls[0] || filteredUrls[0] || videoUrls[0];
-    
-    if (bestVideoUrl) {
-      console.log(`✅ Best video URL selected: ${bestVideoUrl}`);
-      console.log('='.repeat(60) + '\n');
-
-      // Determine if it's downloadable
-      const isM3U8 = bestVideoUrl.includes('.m3u8');
-      const isDirectMP4 = bestVideoUrl.includes('.mp4');
-
-      res.json({
-        success: true,
-        videoUrl: bestVideoUrl,
-        allVideoUrls: filteredUrls.length > 0 ? filteredUrls : videoUrls,
-        title: title || 'Untitled Video',
-        thumbnail: 'https://via.placeholder.com/320x180/4F46E5/ffffff?text=Video',
-        isM3U8: isM3U8,
-        isDirectMP4: isDirectMP4,
-        downloadNote: isM3U8 ? 'This is an HLS stream (.m3u8). You may need a special downloader like FFmpeg or VLC to download it.' : null,
-        qualities: (filteredUrls.length > 0 ? filteredUrls : videoUrls).map((url, i) => ({
-          quality: url.includes('.m3u8') ? 'HLS Stream' : url.includes('.mp4') ? 'MP4' : `Option ${i + 1}`,
-          url: url,
-          type: url.includes('.m3u8') ? 'm3u8' : url.includes('.mp4') ? 'mp4' : 'unknown'
-        }))
-      });
-    } else {
-      console.log('❌ No video found');
-      console.log('='.repeat(60) + '\n');
-      
-      res.status(404).json({
-        success: false,
-        error: 'No video found. This site might use DRM, require login, or use a streaming method we don\'t support yet.',
-        debugInfo: {
-          totalRequests: videoUrls.length,
-          foundInDOM: domVideoData.videos.length + domVideoData.sources.length,
-          iframes: domVideoData.iframes
-        }
-      });
-    }
-
-  } catch (error) {
-    console.error('❌ Error:', error.message);
-    console.log('='.repeat(60) + '\n');
-    
-    if (browser) {
-      await browser.close();
-    }
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Failed to extract video'
-    });
+      const r = await httpGet(url, { headers: headersFor(url, { referer }), responseType: 'text', timeout: 15000 });
+      analysePlaylist(c, r.body, r.url || url);
+    } catch (e) { c.fetchError = e.message; }
   }
-});
+  const cand = {
+    url: c.url, type: c.type, score: c.score, sources: c.sources, referer: c.referer, frameUrl: c.frameUrl,
+    variants: c.playlist?.variants || null, hasSeparateAudio: c.playlist?.hasSeparateAudio || false,
+    encrypted: c.playlist?.encrypted || false, drm: c.playlist?.drm || null,
+    duration: c.playlist?.duration || null, live: c.playlist?.live || false,
+  };
+  let title = 'video';
+  try { title = decodeURIComponent(new URL(url).pathname.split('/').pop().replace(/\.[a-z0-9]+$/i, '')) || 'video'; } catch { /* ignore */ }
+  return {
+    title, thumbnail: null, pageUrl: url, candidates: [cand], iframes: [], usesMSE: false,
+    stats: {}, warnings: c.fetchError ? [`Could not read playlist: ${c.fetchError}`] : [], sessionId, engine: 'direct',
+  };
+}
 
-// Download proxy endpoint
-app.get('/api/download', async (req, res) => {
-  const { url } = req.query;
+app.post('/api/extract', async (req, res) => {
+  const {
+    url, engine = 'auto', timeout, headless = true, blockAds = true, referer,
+  } = req.body || {};
 
-  if (!url) {
-    return res.status(400).send('URL parameter is required');
+  if (!url || !isHttpUrl(String(url).trim())) {
+    return res.status(400).json({ success: false, error: 'A valid http(s) URL is required' });
   }
+  const target = String(url).trim();
+  const timeoutMs = Math.min(Math.max(Number(timeout) || 45000, 10000), 180000);
+
+  log(`\n${'='.repeat(60)}\nExtracting (${engine}): ${target}\n${'='.repeat(60)}`);
+  const logs = [];
+  const tlog = (m) => { logs.push(m); log('  ' + m); };
+  const tools = detect();
 
   try {
-    console.log('Downloading video from:', url);
+    let result = null;
+    const errors = [];
+    const directType = classify(target);
 
-    const response = await axios({
-      method: 'GET',
-      url: url,
-      responseType: 'stream',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Range': 'bytes=0-',
-      },
-      maxRedirects: 5,
-      validateStatus: (status) => status < 400,
-    });
-
-    const urlParts = url.split('/');
-    const filename = urlParts[urlParts.length - 1].split('?')[0] || `video_${Date.now()}.mp4`;
-
-    res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    
-    if (response.headers['content-length']) {
-      res.setHeader('Content-Length', response.headers['content-length']);
-    }
-
-    response.data.pipe(res);
-
-    response.data.on('error', (error) => {
-      console.error('Stream error:', error);
-      if (!res.headersSent) {
-        res.status(500).send('Failed to download video');
+    if (directType && directType !== 'segment' && engine !== 'ytdlp') {
+      result = await extractDirect(target, referer);
+    } else {
+      if (engine === 'ytdlp') {
+        try { result = await extractWithYtdlp(target, { referer }); } catch (e) { errors.push(`yt-dlp: ${e.message}`); }
       }
-    });
-
-  } catch (error) {
-    console.error('Download error:', error.message);
-    if (!res.headersSent) {
-      res.status(500).send(`Failed to download video: ${error.message}`);
+      if (!result && engine !== 'ytdlp') {
+        try {
+          result = await extractWithBrowser(target, {
+            timeout: timeoutMs, headless: headless !== false, blockAds: blockAds !== false, referer, log: tlog,
+          });
+          result.engine = 'browser';
+        } catch (e) {
+          errors.push(`browser: ${e.message}`);
+          tlog(`❌ browser error: ${e.message}`);
+        }
+      }
+      // Fallback to yt-dlp when the browser found nothing useful.
+      if ((engine === 'auto') && tools.ytdlp && (!result || !hasUsable(result))) {
+        tlog('↪️ trying yt-dlp fallback...');
+        const tryUrls = [target];
+        if (result?.embedUrl) tryUrls.push(result.embedUrl);
+        for (const u of tryUrls) {
+          try {
+            const y = await extractWithYtdlp(u, { referer: u === target ? referer : target });
+            if (result) {
+              y.candidates.push(...result.candidates);
+              y.warnings.push(...(result.warnings || []));
+              y.iframes = result.iframes;
+              y.stats = result.stats;
+              if (!y.thumbnail) y.thumbnail = result.thumbnail;
+            }
+            result = y;
+            break;
+          } catch (e) { errors.push(`yt-dlp: ${e.message}`); tlog(`yt-dlp: ${e.message}`); }
+        }
+      }
     }
+
+    if (!result) {
+      return res.status(500).json({ success: false, error: errors.join(' | ') || 'Extraction failed', logs });
+    }
+
+    const payload = {
+      success: result.candidates.length > 0,
+      ...result,
+      ...legacyFields(result),
+      errors,
+      logs,
+      tools: { ffmpeg: !!tools.ffmpeg, ytdlp: !!tools.ytdlp },
+    };
+    if (!payload.success) {
+      payload.error = 'No video found. The site may use DRM, require login, need a manual click (try "Show browser"), ' +
+        'or embed the player in an iframe — try extracting one of the iframes listed below.';
+      return res.status(404).json(payload);
+    }
+    return res.json(payload);
+  } catch (error) {
+    console.error('❌ Error:', error);
+    return res.status(500).json({ success: false, error: error.message || 'Failed to extract video', logs });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`
-╔════════════════════════════════════════╗
-║   Video Extractor Backend Server       ║
-║   Running on http://localhost:${PORT}   ║
-╚════════════════════════════════════════╝
-  `);
+// ---------------------------------------------------------------------------
+// Direct download proxy (streams to the browser, supports Range / resume)
+// ---------------------------------------------------------------------------
+app.get('/api/download', async (req, res) => {
+  const { url, sid, referer, title, inline } = req.query;
+  if (!url || !isHttpUrl(url)) return res.status(400).send('A valid http(s) url parameter is required');
+
+  const ac = new AbortController();
+  res.on('close', () => { if (!res.writableFinished) ac.abort(); });
+
+  try {
+    const headers = headersFor(url, { sid, referer });
+    if (req.headers.range) headers.range = req.headers.range;
+    const upstream = await fetch(url, { headers: lower(headers), redirect: 'follow', signal: ac.signal });
+
+    if (!upstream.ok && upstream.status !== 206) {
+      await upstream.body?.cancel().catch(() => {});
+      return res.status(502).send(`Upstream responded ${upstream.status}. The link may have expired or needs a different Referer — try extracting again.`);
+    }
+    const ct = upstream.headers.get('content-type') || '';
+    if (/text\/html/i.test(ct) && !/\.(mp4|webm|mkv|mov)(\?|$)/i.test(url)) {
+      await upstream.body?.cancel().catch(() => {});
+      return res.status(502).send('Upstream returned an HTML page instead of a video (hotlink protection or expired token). Try extracting again.');
+    }
+
+    const urlExt = extFromUrl(upstream.url || url);
+    const ext = urlExt && ['mp4', 'webm', 'mkv', 'mov', 'flv', 'm4v', 'mp3', 'm4a', 'ts'].includes(urlExt)
+      ? urlExt : extFromContentType(ct);
+    let base = title;
+    if (!base) {
+      try { base = decodeURIComponent(new URL(url).pathname.split('/').pop().replace(/\.[a-z0-9]+$/i, '')); } catch { base = ''; }
+    }
+    res.status(upstream.status === 206 ? 206 : 200);
+    res.setHeader('Content-Type', ct && !/octet-stream|text\//i.test(ct) ? ct : `video/${ext === 'mkv' ? 'x-matroska' : ext}`);
+    res.setHeader('Content-Disposition', contentDisposition(`${base || 'video'}.${ext}`, inline === '1'));
+    res.setHeader('Accept-Ranges', upstream.headers.get('accept-ranges') || 'bytes');
+    for (const h of ['content-length', 'content-range', 'last-modified', 'etag']) {
+      const v = upstream.headers.get(h);
+      if (v) res.setHeader(h, v);
+    }
+    if (!upstream.body) return res.end();
+    await pipeline(Readable.fromWeb(upstream.body), res).catch((e) => {
+      if (!ac.signal.aborted) console.error('Stream error:', e.message);
+    });
+  } catch (error) {
+    if (ac.signal.aborted) return undefined;
+    console.error('Download error:', error.message);
+    if (!res.headersSent) res.status(500).send(`Failed to download video: ${error.message}`);
+    else res.destroy();
+  }
+  return undefined;
 });
+
+// ---------------------------------------------------------------------------
+// Ready-to-paste commands (include the captured Referer / Cookie headers)
+// ---------------------------------------------------------------------------
+function shQuote(s) { return `"${String(s).replace(/(["\\$`])/g, '\\$1')}"`; }
+
+app.get('/api/commands', (req, res) => {
+  const { url, sid, referer, title } = req.query;
+  if (!url || !isHttpUrl(url)) return res.status(400).json({ error: 'url required' });
+  const h = headersFor(url, { sid, referer });
+  const out = `${String(title || 'video').replace(/[^\w.-]+/g, '_').slice(0, 80)}.mp4`;
+  const ff = ffmpegHeaderArgs(h).map((a, i) => (i % 2 ? shQuote(a.replace(/\r\n/g, '\\r\\n')) : a)).join(' ');
+  const ytdlp = ['yt-dlp', '--user-agent', shQuote(h['user-agent'])];
+  if (h.referer) ytdlp.push('--referer', shQuote(h.referer));
+  for (const [k, v] of Object.entries(h)) {
+    if (['user-agent', 'referer', 'accept', 'accept-language'].includes(k)) continue;
+    ytdlp.push('--add-header', shQuote(`${k}:${v}`));
+  }
+  ytdlp.push('-o', shQuote(out), shQuote(url));
+  res.json({
+    ffmpeg: `ffmpeg ${ff} -i ${shQuote(url)} -c copy -bsf:a aac_adtstoasc ${shQuote(out)}`,
+    ytdlp: ytdlp.join(' '),
+    curl: `curl -L ${Object.entries(h).map(([k, v]) => `-H ${shQuote(`${k}: ${v}`)}`).join(' ')} -o ${shQuote(out)} ${shQuote(url)}`,
+    headers: h,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Server-side download jobs (HLS / DASH / yt-dlp / direct) with progress
+// ---------------------------------------------------------------------------
+app.post('/api/jobs', (req, res) => {
+  const { kind, url, sid, referer, variantUrl, format, title } = req.body || {};
+  if (!url || !isHttpUrl(url)) return res.status(400).json({ error: 'A valid url is required' });
+  const tools = detect();
+  let k = kind;
+  if (!k || k === 'auto') {
+    const t = classify(url);
+    if (t === 'hls') k = 'hls';
+    else if (t === 'dash') k = tools.ffmpeg ? 'ffmpeg' : 'ytdlp';
+    else if (DIRECT_TYPES.has(t)) k = 'direct';
+    else k = tools.ytdlp ? 'ytdlp' : 'direct';
+  }
+  if (k === 'ffmpeg' && !tools.ffmpeg) return res.status(400).json({ error: 'ffmpeg is not installed (see README: npm run setup-tools)' });
+  if (k === 'ytdlp' && !tools.ytdlp) return res.status(400).json({ error: 'yt-dlp is not installed (see README: npm run setup-tools)' });
+  try {
+    const job = createJob(k, { url, sid, referer, variantUrl, format, title });
+    log(`⬇️  job ${job.id} (${k}) ${url}`);
+    res.json(publicJob(job));
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get('/api/jobs', (req, res) => res.json(listJobs()));
+
+app.get('/api/jobs/:id', (req, res) => {
+  const j = getJob(req.params.id);
+  if (!j) return res.status(404).json({ error: 'job not found' });
+  return res.json(publicJob(j));
+});
+
+app.delete('/api/jobs/:id', (req, res) => {
+  if (!cancelJob(req.params.id)) return res.status(404).json({ error: 'job not found' });
+  return res.json(publicJob(getJob(req.params.id)));
+});
+
+app.get('/api/jobs/:id/file', (req, res) => {
+  const j = getJob(req.params.id);
+  if (!j || j.status !== 'done' || !j.file || !fs.existsSync(j.file)) return res.status(404).send('File not ready');
+  res.setHeader('Content-Disposition', contentDisposition(path.basename(j.file), req.query.inline === '1'));
+  return res.sendFile(j.file);
+});
+
+// ---------------------------------------------------------------------------
+// Serve the production frontend build if present (single-port mode).
+// ---------------------------------------------------------------------------
+const BUILD_DIR = path.join(__dirname, '..', 'frontend', 'build');
+if (fs.existsSync(BUILD_DIR)) {
+  app.use(express.static(BUILD_DIR));
+  app.get(/^\/(?!api\/).*/, (req, res) => res.sendFile(path.join(BUILD_DIR, 'index.html')));
+}
+
+// ---------------------------------------------------------------------------
+if (require.main === module) {
+  const server = app.listen(PORT, HOST, () => {
+    const t = detect();
+    console.log(`
+╔════════════════════════════════════════════╗
+║   Video Extractor Backend Server           ║
+║   http://${HOST}:${PORT}${' '.repeat(Math.max(0, 33 - HOST.length - String(PORT).length))}║
+╚════════════════════════════════════════════╝
+  ffmpeg : ${t.ffmpeg ? t.ffmpeg.version.slice(0, 60) : 'not found (optional: HLS saved as .ts, no DASH)'}
+  yt-dlp : ${t.ytdlp ? t.ytdlp.version : 'not found (optional: no 1800+ site support / fallback)'}
+  output : ${DOWNLOAD_DIR}
+`);
+  });
+  const shutdown = async () => {
+    console.log('\nShutting down...');
+    server.close();
+    await closeBrowsers();
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
+module.exports = app;

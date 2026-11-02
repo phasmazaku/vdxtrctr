@@ -1,10 +1,12 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Video URL extractor / downloader backend (puppeteer sniffer + HLS downloader)",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "test": "node test/e2e.js",
+    "setup-tools": "node scripts/setup-tools.js"
   },
   "keywords": [],
   "author": "",
@@ -16,5 +18,8 @@
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "puppeteer": "^24.34.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
